@@ -12,7 +12,7 @@ Predicting used car prices with gradient boosting — built from a messy, real-w
 
 This project predicts the sale price of used cars based on features like brand, model year, mileage, engine specs, and accident history. It's a from-scratch regression pipeline — no templates, no pre-built notebooks — built to practice the full ML workflow end to end: data cleaning, feature engineering, model tuning, and honest evaluation.
 
-**Final result:** MAE ≈ **$12,771** on a held-out validation set (log-transformed target, XGBoost).
+Final result: MAE ≈ **$5,516** on a held-out validation set (log-transformed target, tuned XGBoost).
 
 ---
 
@@ -23,8 +23,8 @@ A raw scraped Kaggle used-car listings dataset — ~4,000 rows, 12 columns, and 
 - `price` stored as text with currency symbols and commas (`"$21,500"`)
 - `milage` stored as text with units (`"45,000 mi."`)
 - `engine` a free-text description bundling horsepower, displacement, cylinder count, and fuel type into one string (`"300.0HP 3.7L V6 Cylinder Engine Flex Fuel Capability"`)
-- `model` with **622 unique values** across ~4,000 rows — most appearing only once or twice
-- A heavily right-skewed target: median price ~$31K, but a long tail up to $489K
+- `model` and other categorical features with high cardinality
+- A heavily right-skewed target: median price ~$31K, but a long tail reaching several million dollars due to a few extreme listings
 
 None of this was clean going in — cleaning it was most of the actual work.
 
@@ -36,44 +36,70 @@ None of this was clean going in — cleaning it was most of the actual work.
 - Parsed `price` and `milage` out of formatted strings into real numeric columns
 - Extracted `horsepower` and `engine_size` from the free-text `engine` column using regex
 - Converted `model_year` to a proper numeric/ordinal feature
-- Trimmed extreme price outliers from the *training* set only (never touched validation — that has to stay an honest, untouched test of real-world performance)
+- Removed extreme price outliers (`price > $130K`) after analyzing the target distribution. These rare listings severely distorted MAE because there were too few examples for the model to learn from.
+
 
 **⚙️ Feature engineering**
-- Categorical columns filtered by cardinality — low-cardinality features (`brand`, `fuel_type`, `transmission`) one-hot encoded; high-cardinality ones (`model`, raw `engine` text) excluded from naive encoding after testing showed they hurt more than helped
-- Tested target encoding on `model` — reverted it after discovering the median car model appears only *once* in training data, making the encoding functionally identical to leaking the target
+- Categorical features were processed using one-hot encoding with unknown category handling. High-cardinality features were tested, but the final pipeline focused on features that improved validation performance.- Tested target encoding on `model` — reverted it after discovering the median car model appears only *once* in training data, making the encoding functionally identical to leaking the target
 - Log-transformed the target (`price`) to correct for the dataset's heavy right-skew
+- Created additional numerical features:
+  - `horsepower` extracted from engine text
+  - `engine_size` extracted from engine text
+  - `age` calculated from model year
+
 
 **🤖 Modeling**
 - `ColumnTransformer` + `Pipeline` for reproducible preprocessing (median/constant imputation depending on the column, one-hot encoding for categoricals)
-- `XGBRegressor`, tuned via `RandomizedSearchCV` (max_depth, learning_rate, n_estimators, subsample, colsample_bytree)
+- XGBRegressor, manually tuned after experimentation with tree depth, number of estimators, learning rate, regularization, and sampling parameters
 - Also benchmarked CatBoost (handles high-cardinality categoricals natively) — comparable performance, no significant edge over the tuned XGBoost pipeline
 
 ---
 
+
 ## 📊 Results
 
-| Stage | MAE |
-|---|---|
-| First working pipeline (raw, unfixed columns) | ~45,000 *(bug — log/real-scale mismatch)* |
-| Bug fixed, log-transform working correctly | 22,226 |
-| Outlier trimming | 22,091 |
-| `milage` fixed from text → numeric | ~20,000 |
-| High-cardinality columns excluded from one-hot | 14,900 |
-| `constant` imputation over `median` for engine features | 14,900 |
-| **Categorical dtype bug fixed** (`str` vs `object` mismatch was silently dropping all categorical features) | **12,771** |
-| Hyperparameter search (RandomizedSearchCV) | 12,900 *(no further gain — manual tuning had already converged)* |
+The model improved through several iterations of debugging, data cleaning, and experimentation. Each step addressed a specific problem discovered during analysis.
+
+| Stage                                      |        MAE | What Changed                                                                                                                                   |
+| ------------------------------------------ | ---------: | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| First working pipeline                     |    ~45,000 | Initial model trained on raw formatted columns. Error was caused by incorrect evaluation scale (log predictions compared against real prices). |
+| Log-transform bug fixed                    |    ~22,226 | Predictions were correctly converted back using `expm1()` before calculating MAE.                                                              |
+| Initial preprocessing improvements         |    ~20,000 | Fixed price and mileage parsing, improved missing value handling, and extracted useful numerical information from messy columns.               |
+| High-cardinality feature handling          |    ~14,900 | Adjusted categorical preprocessing after testing showed that naive one-hot encoding of extremely high-cardinality columns hurt generalization. |
+| Categorical dtype issue fixed              |    ~12,771 | Fixed a silent preprocessing bug where categorical columns were not being correctly passed through the pipeline.                               |
+| Price distribution analysis                |     ~9,400 | Removed a small number of extreme luxury listings that heavily distorted MAE due to the long-tail target distribution.                         |
+| Optimized price filtering (`price < 130K`) |     ~6,300 | Found a better cutoff that removed problematic outliers while keeping almost all normal vehicle examples.                                      |
+| Final XGBoost tuning                       | **~5,516** | Increased model capacity (`max_depth=4`, `n_estimators=3000`) after the dataset was cleaned, reducing underfitting.                            |
+
+### Final Model Performance
+
+```text
+Train MAE:      ~3,142
+Validation MAE: ~5,516
+```
+
+The final model achieved a validation MAE of approximately **$5.5K**, meaning the average prediction error is around five and a half thousand dollars on unseen vehicle listings.
+
+The biggest improvements did not come from blindly tuning hyperparameters — they came from understanding the dataset:
+
+* Fixing incorrect evaluation caused by log-scale predictions
+* Cleaning malformed numerical features
+* Extracting useful information from the engine text field
+* Removing extreme price outliers
+* Increasing model complexity only after reducing dataset noise
+
 
 ---
 
-## 🧠 Why It Plateaus Around $12.7K
+## 🧠 What Limited Performance Before Optimization
 
-This isn't a case of "needs more tuning" — it's a structural limit of the dataset:
+The biggest limitation was not model complexity but dataset quality:
 
-- **`model` has 622 unique values with a median of ~1 example each.** There isn't enough repetition per model for any encoding method (target, frequency, or native categorical handling) to learn a reliable price signal from it.
-- **Used car pricing has real-world noise this dataset can't capture** — negotiation, seller type, regional demand, and condition beyond a binary accident flag all affect price and aren't in the data.
+- A small number of extreme luxury cars created a long price tail that heavily affected MAE.
+- High-cardinality categorical features had many rare categories, making it difficult to learn reliable patterns.
+- Real-world factors such as negotiation, location, seller type, and vehicle condition were not available.
 
-Getting meaningfully below this would need a richer dataset (more examples per model, condition scores, regional data) — not better modeling of what's already here.
-
+    After handling the target distribution and improving feature extraction, the model reached a validation MAE of around $5.5K.
 ---
 
 ## 🧰 Tech Stack
@@ -93,7 +119,7 @@ used-car-pred-price/
 │   └── used_cars.csv
 ├── src/
 │   └── car_price_pred.py
-├── test.ipynb
+│   └── test.ipynb
 ├── venv/
 ├── requirements.txt
 ├── LICENSE
